@@ -36,7 +36,7 @@ users_collection = db["users"]
 postbacks_collection = db["postbacks"]
 user_status_collection = db["user_status"]
 
-# indexes (created once)
+# Indexes (created once)
 postbacks_collection.create_index([("trader_id", ASCENDING), ("createdAt", DESCENDING)])
 user_status_collection.create_index("trader_id", unique=True)
 
@@ -49,7 +49,6 @@ STATUS_VERIFIED = "verified"
 
 # ================== HELPERS ==================
 def _truthy(v) -> bool:
-    """Normalize truthy values from query/body."""
     if isinstance(v, bool):
         return v
     if v is None:
@@ -62,7 +61,24 @@ def _utcnow():
     return datetime.now(timezone.utc)
 
 
-# ================== POSTBACK WEBHOOK ==================
+# ================== HEALTH & ROOT ==================
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "service": "tg-pocketoption-bot", "time": _utcnow().isoformat()}), 200
+
+
+@app.get("/health")
+def health():
+    db_ok = True
+    try:
+        mongo_client.admin.command("ping")
+    except Exception:
+        db_ok = False
+    return jsonify({"ok": True, "db": db_ok, "time": _utcnow().isoformat()}), 200
+
+
+# ================== POCKET OPTION POSTBACK ==================
+# Path matches your Render deploy: /api/pocket/postback
 @app.route("/api/pocket/postback", methods=["GET", "POST"])
 def handle_postback():
     try:
@@ -79,10 +95,9 @@ def handle_postback():
 
         reg = _truthy(data.get("reg"))
         conf = _truthy(data.get("conf"))
-        ftd = _truthy(data.get("ftd"))
+        ftd = __truthy(data.get("ftd")) if (fn := locals()).get("_truthy") else _truthy(data.get("ftd"))  # safety
         dep = _truthy(data.get("dep"))
 
-        # priority: ftd -> dep -> reg -> conf
         event = None
         if ftd:
             event = "ftd"
@@ -109,27 +124,28 @@ def handle_postback():
         }
         postbacks_collection.insert_one(doc)
 
-        # aggregate status per trader
         if trader_id:
             incr_registered = reg or conf
             incr_deposited = ftd or dep
 
-            update = {
-                "$setOnInsert": {"createdAt": _utcnow(), "trader_id": trader_id},
-                "$set": {"updatedAt": _utcnow(), "last_event": event},
-                "$max": {},
-            }
             status = user_status_collection.find_one({"trader_id": trader_id}) or {}
             new_registered = bool(status.get("registered")) or incr_registered
             new_deposited = bool(status.get("deposited")) or incr_deposited
-            update["$set"]["registered"] = new_registered
-            update["$set"]["deposited"] = new_deposited
 
             user_status_collection.update_one(
-                {"trader_id": trader_id}, update, upsert=True
+                {"trader_id": trader_id},
+                {
+                    "$setOnInsert": {"createdAt": _utcnow(), "trader_id": trader_id},
+                    "$set": {
+                        "updatedAt": _utcnow(),
+                        "last_event": event,
+                        "registered": new_registered,
+                        "deposited": new_deposited,
+                    },
+                },
+                upsert=True,
             )
 
-            # sync with a user record (if they already sent UID)
             user = users_collection.find_one({"uid": trader_id})
             if user:
                 to_set = {}
@@ -171,13 +187,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        "👋 Welcome to the PocketOption Trading Signals Bot!\n\n"
-        "To get access you need to pass verification:\n"
-        "1) Register via the partner link\n"
-        "2) Confirm your email\n"
-        "3) Make the first deposit\n"
-        "4) Send your UID (Trader ID)\n\n"
-        "Tap the button below to begin 👇",
+        "👋 *Welcome to the PocketOption Trading Signals Bot\\!* \n\n"
+        "To get access you need to be verified:\n"
+        "1️⃣ Register via our partner link\n"
+        "2️⃣ Confirm your email\n"
+        "3️⃣ Make your first deposit\n"
+        "4️⃣ Send your UID\n\n"
+        "Press the button below 👇",
+        parse_mode="MarkdownV2",
         reply_markup=reply_markup,
     )
 
@@ -191,18 +208,18 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user and user.get("status") == STATUS_VERIFIED:
         await query.edit_message_text(
-            "✅ You are already verified!\n"
-            "Send a chart screenshot and I'll generate a signal 📊"
+            "✅ *You are already verified\\!* Send a chart screenshot and I’ll generate a signal 📊",
+            parse_mode="MarkdownV2",
         )
         return
 
     keyboard = [
         [InlineKeyboardButton("📝 Register", url=PARTNER_LINK)],
-        [InlineKeyboardButton("✅ I have registered", callback_data="reg_done")],
+        [InlineKeyboardButton("✅ I’m registered", callback_data="reg_done")],
     ]
     await query.edit_message_text(
         "🔐 STEP 1: Registration\n\n"
-        "Register via the link above, confirm your email and then tap “I have registered”.",
+        "Register via the link above, confirm your email and then press “I’m registered”.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -214,7 +231,8 @@ async def reg_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("✅ Enter UID", callback_data="enter_uid")]]
     await query.edit_message_text(
         "💰 STEP 2: First deposit\n\n"
-        "Make your first deposit on PocketOption, then tap “Enter UID”.",
+        "Make your first deposit on PocketOption.\n"
+        "Then press “Enter UID”.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -229,8 +247,8 @@ async def enter_uid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     await query.edit_message_text(
-        "🆔 STEP 3: Send UID\n\n"
-        "Please send your *Trader ID* (UID) from po.cash in the next message."
+        "🆔 STEP 3: Enter UID\n\n"
+        "Send your *Trader ID* (UID) from po.cash in the next message.",
     )
 
 
@@ -250,7 +268,7 @@ async def handle_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         {"$set": {"uid": uid, "status": STATUS_WAITING_VERIFICATION}},
     )
 
-    await update.message.reply_text("⏳ Checking your data…")
+    await update.message.reply_text("⏳ Checking your status…")
     await asyncio.sleep(2)
 
     status = user_status_collection.find_one({"trader_id": uid})
@@ -270,7 +288,7 @@ async def handle_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(
             "✅ Verification passed!\n\n"
-            "Send a chart screenshot and I’ll give you a trading signal 📊"
+            "Send a chart screenshot and I’ll generate a trading signal 📊"
         )
     else:
         missing = []
@@ -282,7 +300,7 @@ async def handle_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Verification failed.\n\n"
             f"Missing: {', '.join(missing) if missing else 'data'}\n\n"
-            "Check the steps and try again via /start."
+            "Please complete the steps and try again with /start."
         )
 
 
@@ -294,12 +312,12 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = users_collection.find_one({"telegram_id": user_id})
 
     if not user:
-        await update.message.reply_text("❌ Please /start first.")
+        await update.message.reply_text("❌ Please register first via /start")
         return
 
     if user.get("status") != STATUS_VERIFIED:
         await update.message.reply_text(
-            "❌ Access denied. Pass verification via /start."
+            "❌ Access denied. Please pass verification via /start."
         )
         return
 
@@ -307,10 +325,10 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Please send a chart screenshot.")
         return
 
-    thinking = await update.message.reply_text("🤖 Analyzing the chart…")
+    thinking = await update.message.reply_text("🤖 Analyzing chart…")
     for i in range(6, 0, -1):
         await asyncio.sleep(1)
-        await thinking.edit_text(f"🤖 Analyzing the chart… {i}s")
+        await thinking.edit_text(f"🤖 Analyzing chart… {i}s")
 
     direction = random.choice(["📈 LONG (up)", "📉 SHORT (down)"])
     duration = random.choice([5, 10, 15, 20, 25, 30])
@@ -319,9 +337,9 @@ async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await thinking.edit_text(
         "🎯 TRADING SIGNAL\n\n"
         f"Direction: {direction}\n"
-        f"Expiry: {duration} sec\n"
+        f"Expiry: {duration} seconds\n"
         f"Confidence: {confidence}%\n\n"
-      
+        "⚠️ Educational bot — not financial advice."
     )
 
     users_collection.update_one({"telegram_id": user_id}, {"$inc": {"signals": 1}})
@@ -331,7 +349,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(
             "📖 Commands:\n"
-            "/start — begin\n"
+            "/start — start\n"
             "/status — verification status\n"
             "/help — help\n\n"
             "After verification, send a chart screenshot."
@@ -343,7 +361,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = users_collection.find_one({"telegram_id": update.effective_user.id})
     if not user:
-        await update.message.reply_text("❌ You are not registered. Use /start.")
+        await update.message.reply_text("❌ You are not registered. Use /start")
         return
 
     status_emoji = {
@@ -369,7 +387,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ================== BOT RUN ==================
+# ================== RUN BOT ==================
 def run_bot():
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -385,9 +403,9 @@ def run_bot():
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-# ================== START EVERYTHING ==================
+# ================== ENTRYPOINT ==================
 if __name__ == "__main__":
-    # Run Flask on a side thread (defaults to 5001 locally)
+    # Flask in a separate thread. On Render, the port must be $PORT.
     def run_flask():
         port = int(os.getenv("PORT", 5001))
         app.run(host="0.0.0.0", port=port)
